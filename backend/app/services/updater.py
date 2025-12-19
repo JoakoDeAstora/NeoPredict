@@ -1,31 +1,25 @@
-
-from apscheduler.schedulers.background import BackgroundScheduler
 from app.services.market_data import MarketDataService
 from app.services import data_service
 from app.config import CLUSTERS_CONFIG
-import asyncio
+# Ya no necesitamos 'apscheduler' ni 'asyncio' explícito aquí si usamos FastAPI correctamente
 
 class UpdaterService:
     def __init__(self):
         self.market_service = MarketDataService()
-        self.scheduler = BackgroundScheduler()
+        # ELIMINADO: self.scheduler = BackgroundScheduler() -> Ya no es necesario
 
-    def start(self):
-        """
-        Starts the background scheduler.
-        Configured to run immediately on startup (for demo) and then every 24 hours.
-        """
-        # Add job
-        self.scheduler.add_job(self.run_update_cycle, 'interval', minutes=1, id='market_update_job') # 1 min for testing
-        self.scheduler.start()
-        print(" [UPDATER] Background Scheduler Started.")
+    # ELIMINADO: def start(self): ... 
+    # Ya no arrancamos un reloj interno. La nube nos "despierta" cuando es hora.
 
-    def run_update_cycle(self):
+    async def run_update_cycle(self):
         """
-        Main logic wrapper to run async code in sync scheduler.
+        Esta función ahora es 'async' para ser llamada directamente 
+        desde el endpoint de FastAPI en main.py sin bloquear el servidor.
         """
-        print(" [UPDATER] Starting update cycle...")
-        asyncio.run(self._update_all_tickers())
+        print(" [UPDATER] Starting update cycle triggered by Cloud Scheduler...")
+        
+        # Llamamos directamente a la lógica interna
+        await self._update_all_tickers()
 
     async def _update_all_tickers(self):
         from app.services.scraper import CmfScraperService
@@ -35,21 +29,22 @@ class UpdaterService:
             try:
                 print(f" [UPDATER] Updating {ticker}...")
                 
-                # 1. Fetch Market Data (Annual) - Phase 2 (Historical DB)
-                # data = await self.market_service.get_annual_data(ticker) # Commented out to focus on Robot for now or assume mocked
+                # 1. Fetch Market Data (Simulado o Real)
+                # data = await self.market_service.get_annual_data(ticker)
                 # if data: data_service.save_market_data(ticker, data)
 
-                # 2. Run Robot Recolector (Web Scraping) - Phase 1
+                # 2. Run Robot Recolector (Web Scraping)
                 if hasattr(config, 'investor_url') and config.investor_url:
+                    # Nota: Si scraper.visit_investor_site NO es async, lo ejecutamos directo.
+                    # Si fuera async, usaríamos 'await'. Asumo que es síncrono por tu código anterior.
                     content = scraper.visit_investor_site(ticker, config.investor_url)
+                    
                     if content:
                         clean_content = scraper.clean_text(content)
-                        # Phase 2: Save Unstructured Data
+                        # Guardar datos no estructurados
                         data_service.save_unstructured_data(ticker, clean_content, config.investor_url)
                         
-                        # Phase 3: Trigger Neural Network Prediction (Mock Trigger)
-                        # In real life: predictor = PredictionService(); result = await predictor.predict_year(ticker, 2025)
-                        # data_service.save_prediction(ticker, result)
+                        # Aquí iría la predicción (Fase 3)
                         
                 print(f" [UPDATER] Success cycle for {ticker}")
 

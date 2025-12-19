@@ -13,3 +13,7 @@ requests
 pydantic
 python-multipart
 apscheduler
+google-cloud-storage
+sklearn
+yfinance
+apscheduler

@@ -1,85 +1,106 @@
 import torch
-import numpy as np
-from app.services.market_data import MarketDataService
-from app.services.sentiment import SentimentService
-from app.models.hybrid_model import HybridPredictor
-from app.services.scraper import CmfScraperService
+import os
+import logging
+from google.cloud import storage
+from app.models.hybrid_model import FinancialNeuralNet  # Tu modelo de red neuronal
+# from app.utils.preprocessing import format_data # Si tienes un formateador específico, impórtalo aquí
+
+# Configuración de Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("PredictorService")
 
 class PredictionService:
     def __init__(self):
-        self.market_data = MarketDataService()
-        self.sentiment = SentimentService()
-        self.scraper = CmfScraperService()
+        """
+        Inicializa el servicio, descarga los pesos de la nube y prepara el modelo.
+        """
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # Load Model
-        self.model = HybridPredictor()
-        # In a real scenario, we would load weights here:
-        # self.model.load_state_dict(torch.load("path/to/weights.pth"))
-        self.model.eval()
+        # Configuración de Google Cloud Storage
+        self.bucket_name = "neopredict-weights"  # Nombre de tu Bucket en GCP
+        self.remote_weights_name = "model_weights.pth"
+        
+        # En Cloud Run, solo podemos escribir en /tmp
+        self.local_weights_path = "/tmp/model_weights.pth" 
 
-    async def predict_year(self, ticker: str, year: int):
-        """
-        Orchestrates the prediction pipeline.
-        1. Get numeric history up to (year-1)
-        2. Get text sentiment for year-1 (or current available)
-        3. Predict
-        """
-        # 1. Numeric Data
-        history = await self.market_data.get_annual_data(ticker)
-        # Filter strictly before target year for causality
-        past_data = [d for d in history if d['year'] < year]
+        # 1. Instanciar la arquitectura del modelo
+        self.model = FinancialNeuralNet().to(self.device)
         
-        if len(past_data) < 5:
-            # Need at least some history for LSTM
-            return {"error": "Insufficient historical data"}
+        # 2. Cargar los pesos (Intenta bajar de la nube, sino usa locales o aleatorios)
+        self._load_model_weights()
+
+    def _load_model_weights(self):
+        """
+        Intenta descargar los pesos desde GCS. Si falla, busca en local.
+        """
+        try:
+            # Opción A: Intentar descargar de Google Cloud Storage
+            logger.info("☁️ Conectando a GCS para descargar pesos...")
+            client = storage.Client()
+            bucket = client.bucket(self.bucket_name)
+            blob = bucket.blob(self.remote_weights_name)
+            blob.download_to_filename(self.local_weights_path)
+            logger.info("✅ Pesos descargados correctamente en /tmp.")
             
-        # Prepare numeric tensor (last 5 years for simple lag)
-        recent_years = past_data[-5:]
-        numeric_features = [[d['close'], d['volume'], d['volatility'], d['high'], d['low']] for d in recent_years]
-        numeric_tensor = torch.tensor([numeric_features], dtype=torch.float32) # Batch size 1
+            # Cargar en PyTorch
+            self.model.load_state_dict(torch.load(self.local_weights_path, map_location=self.device))
+            self.model.eval() # IMPORTANTE: Poner en modo evaluación (congela Dropout/Batchnorm)
+            logger.info("🧠 Modelo cargado y listo para inferencia.")
+
+        except Exception as e:
+            logger.warning(f"⚠️ No se pudo descargar de GCS: {e}")
+            logger.info("🔄 Intentando buscar pesos locales de respaldo o iniciando con pesos aleatorios.")
+            
+            # Opción B: Si tienes un archivo local (para desarrollo offline)
+            local_backup = "backend/app/models/weights.pth"
+            if os.path.exists(local_backup):
+                self.model.load_state_dict(torch.load(local_backup, map_location=self.device))
+                self.model.eval()
+                logger.info("📂 Modelo local cargado.")
+            else:
+                logger.warning("⚠️ ¡ADVERTENCIA! El modelo está usando pesos ALEATORIOS (sin entrenar).")
+
+    async def predict_year(self, ticker: str, financial_features: list, sentiment_score: float):
+        """
+        Realiza la predicción combinando datos numéricos y de texto.
         
-        # 2. Sentiment Data
-        # Try to find memory for year-1
-        prev_year = year - 1
-        # For demo purposes, since we can't scrape, we might simulate sentiment
-        # or use a placeholder text if scraping fails
-        sentiment_text = f"Memoria anual {ticker} {prev_year}. El año presentó desafíos en el mercado del litio y volatilidad cambiaria..."
+        Args:
+            ticker (str): Símbolo de la empresa.
+            financial_features (list): Lista de floats [ROE, Debt, Assets, etc.]
+            sentiment_score (float): Score del análisis de sentimiento (-1 a 1).
         
-        # If we had the scraper working:
-        # pdf_path = self.scraper.search_annual_report(ticker, prev_year)
-        # if pdf_path: text = self.scraper.extract_text(pdf_path) ...
-        
-        text_embedding = self.sentiment.get_embedding(sentiment_text)
-        
-        # 3. Predict
-        with torch.no_grad():
-            probs = self.model(numeric_tensor, text_embedding)
-        
-        # Interpretation
-        classes = ["Bearish", "Neutral", "Bullish"]
-        prediction_idx = torch.argmax(probs, dim=1).item()
-        confidence = probs[0][prediction_idx].item()
-        
-        result = {
-            "target_year": year,
-            "prediction": classes[prediction_idx],
-            "confidence": confidence,
-            "probabilities": {
-                "bearish": probs[0][0].item(),
-                "neutral": probs[0][1].item(),
-                "bullish": probs[0][2].item()
-            },
-            "sentiment_summary": self.sentiment.analyze_text(sentiment_text, ticker=ticker) 
-        }
-        
-        # 4. Post-Processing (Cluster Specific Logic)
-        from app.config import CLUSTERS_CONFIG
-        config = CLUSTERS_CONFIG.get(ticker)
-        if config and ticker == "COPEC":
-            # Inhibition Neuron Logic: If Forestry/Celulosa sentiment is very negative, reduce confidence
-            # This simulates the "inhibition" of that driver in the final output
-            if "Celulosa" in sentiment_text and result['sentiment_summary'] < -0.3:
-                 result['confidence'] *= 0.8 # Reduce confidence/weight
-                 result['note'] = "Forestry driver inhibited due to negative outlook."
-        
-        return result
+        Returns:
+            dict: Predicción formateada.
+        """
+        try:
+            # 1. Preprocesamiento de datos (Convertir a Tensores)
+            # Asumimos que financial_features es una lista de números
+            fin_tensor = torch.tensor([financial_features], dtype=torch.float32).to(self.device)
+            
+            # El sentimiento a veces necesita ser una lista o tensor aparte dependiendo de tu hybrid_model
+            sent_tensor = torch.tensor([[sentiment_score]], dtype=torch.float32).to(self.device)
+
+            # 2. Inferencia (Sin calcular gradientes para ahorrar memoria)
+            with torch.no_grad():
+                # Pasamos los datos al modelo. 
+                # NOTA: Ajusta los argumentos según tu definición en hybrid_model.py (forward)
+                prediction = self.model(fin_tensor, sent_tensor)
+                
+            # 3. Post-procesamiento
+            predicted_value = prediction.item() # Convertir tensor a float de Python
+
+            # Lógica de interpretación (Opcional)
+            recommendation = "MANTENER"
+            if predicted_value > 0.05: recommendation = "COMPRAR"
+            elif predicted_value < -0.05: recommendation = "VENDER"
+
+            return {
+                "ticker": ticker,
+                "predicted_variation": round(predicted_value, 4),
+                "recommendation": recommendation,
+                "model_status": "trained" if os.path.exists(self.local_weights_path) else "random_weights"
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error en predicción para {ticker}: {str(e)}")
+            return {"error": "Prediction failed", "details": str(e)}

@@ -1,19 +1,19 @@
-# Usa una versión ligera de Python
-FROM python:3.10-slim
+# Usar imagen base de Python oficial
+FROM python:3.9-slim
 
-# Establece el directorio de trabajo
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Copia los requerimientos e instálalos
+# Copiar archivos de requerimientos e instalar dependencias
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todo el código fuente al contenedor
+# Copiar todo el código al contenedor
 COPY . .
 
-# El puerto por defecto en Cloud Run es 8080
-ENV PORT 8080
+# Exponer el puerto (Cloud Run usa el 8080 por defecto)
+ENV PORT=8080
+EXPOSE 8080
 
-# El comando de inicio (Exactamente como en tu imagen, pero en formato Docker)
-# Nota: backend.main:app asume que tienes una carpeta 'backend' y dentro 'main.py'
-CMD exec uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+# Comando para iniciar la app
+CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8080"]
